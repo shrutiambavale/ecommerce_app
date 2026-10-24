@@ -1,0 +1,134 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && (
+        getUserData().role == 'admin' ||
+        (request.auth.token.role != null && request.auth.token.role == 'admin')
+      );
+    }
+
+    // 1. Users Collection
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isAuthenticated() && request.auth.uid == userId;
+      // Prevent privilege escalation: Regular users cannot change their own 'role'
+      allow update: if isAdmin() || (
+        isOwner(userId) && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['role']))
+      );
+      allow delete: if isAdmin();
+
+      // Nested Addresses subcollection
+      match /addresses/{addressId} {
+        allow read, write: if isOwner(userId) || isAdmin();
+      }
+    }
+
+    // 2. Categories Collection
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // 3. Products Collection
+    match /products/{productId} {
+      allow read: if true;
+      // Must be an admin and assign ownership to self on create
+      allow create: if isAdmin() &&
+        (request.resource.data.ownerId == request.auth.uid);
+      // Only the owning admin can update or delete their products (or legacy unassigned products)
+      allow update: if isAdmin() &&
+        (resource.data.ownerId == request.auth.uid || resource.data.ownerId == null) &&
+        (request.resource.data.ownerId == resource.data.ownerId || request.resource.data.ownerId == request.auth.uid);
+      allow delete: if isAdmin() &&
+        (resource.data.ownerId == request.auth.uid || resource.data.ownerId == null);
+    }
+
+    // 4. Carts Collection
+    match /carts/{userId} {
+      allow read, write: if isOwner(userId) || isAdmin();
+    }
+
+    // 5. Orders Collection
+    match /orders/{orderId} {
+      // Customers can read their own orders; Admin can read all or assigned orders
+      allow read: if isAuthenticated() && (
+        resource.data.customerId == request.auth.uid || isAdmin()
+      );
+
+      // Customer creates order in pending_payment status
+      allow create: if isAuthenticated() &&
+        request.resource.data.customerId == request.auth.uid &&
+        request.resource.data.status == 'pending_payment';
+
+      // Updates: Customers can submit payment proof or cancel
+      allow update: if isAuthenticated() && (
+        isAdmin() ||
+        (
+          resource.data.customerId == request.auth.uid &&
+          (
+            // Customer submits UTR
+            (
+              request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['status', 'utrNumber', 'paymentScreenshotUrl', 'paymentRejectionReason', 'updatedAt']) &&
+              request.resource.data.status == 'payment_verification_pending' &&
+              (resource.data.status == 'pending_payment' || resource.data.status == 'payment_rejected')
+            ) ||
+            // Customer cancels order
+            (
+              request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['status', 'updatedAt']) &&
+              request.resource.data.status == 'cancelled' &&
+              (resource.data.status == 'pending_payment' || resource.data.status == 'payment_verification_pending')
+            )
+          )
+        )
+      );
+
+      // Orders cannot be deleted to preserve financial audit trail
+      allow delete: if false;
+    }
+
+    // 6. Payment Settings Collection (Account-isolated by settingId == adminId)
+    match /payment_settings/{settingId} {
+      allow read: if isAuthenticated();
+      // Admin can only create/update their own payment settings or the shared fallback
+      allow create, update: if isAdmin() && (
+        request.auth.uid == settingId ||
+        (settingId == 'default' && (resource == null || resource.data.ownerId == request.auth.uid))
+      );
+      allow delete: if isAdmin() && (request.auth.uid == settingId);
+    }
+
+    // 7. Payment Submissions Collection
+    match /payment_submissions/{submissionId} {
+      allow read: if isAuthenticated() && (
+        resource.data.customerId == request.auth.uid || isAdmin()
+      );
+      allow create: if isAuthenticated() &&
+        request.resource.data.customerId == request.auth.uid;
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // 8. Audit Logs (Immutable financial ledger)
+    match /audit_logs/{logId} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+  }
+}
